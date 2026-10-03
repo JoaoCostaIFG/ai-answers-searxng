@@ -584,6 +584,8 @@ FRONTEND_JS_TEMPLATE = r"""
     const box = document.getElementById('sxng-stream-box');
     const data = document.getElementById('sxng-stream-data');
     const answerWrap = document.getElementById('sxng-answer-wrap');
+    const answersContainer = box.closest('#answers');
+    if (answersContainer) answersContainer.classList.add('sxng-ai-answers-container');
     const wrapper = box.closest('.answer');
     if (wrapper) wrapper.style.display = 'none';
     let restored = false;
@@ -1654,13 +1656,18 @@ class SXNGPlugin(Plugin):
                         .sxng-markdown pre code {{ padding: 0; background: transparent; white-space: pre; }}
                         .sxng-markdown a {{ color: var(--color-result-link); }}
                         .sxng-citation {{ text-decoration: none; color: var(--color-result-link); font-weight: bold; }}
+                        @media screen and (min-width: 50em) and (max-width: 79.75em) {{
+                            .center-alignment-yes #main_results #answers.sxng-ai-answers-container {{
+                                margin-inline-start: 3rem;
+                            }}
+                        }}
                         @media (min-width: 769px) {{
                             .sxng-chunk {{
                                 animation: sxng-fade-in 0.3s ease-out;
                             }}
                         }}
                         #sxng-answer-wrap {{ position: relative; }}
-                        #sxng-answer-wrap.sxng-collapsed {{ height: 14rem; overflow: hidden; }}
+                        #sxng-answer-wrap.sxng-collapsed {{ max-height: 14rem; overflow: hidden; }}
                         .sxng-show-more-wrap {{
                             display: none; position: absolute; bottom: 0; left: 0; right: 0; height: 4rem;
                             background: linear-gradient(to bottom, transparent, var(--color-base-background, #fff));
