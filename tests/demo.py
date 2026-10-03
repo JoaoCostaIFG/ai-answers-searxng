@@ -4,6 +4,9 @@ import logging
 from types import ModuleType
 from flask import Flask, request
 
+# Allow running from any working directory
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
 logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 # os.environ.setdefault('LLM_STYLE', 'interactive')  # Removed to let plugin config decide defaults
 
@@ -32,6 +35,7 @@ class MockEngineResults:
 searx_plugins.Plugin = MockPlugin
 searx_plugins.PluginInfo = MockPluginInfo
 searx_results.EngineResults = MockEngineResults
+searx.settings = {'server': {'secret_key': 'demo-secret-key'}}
 
 sys.modules["searx"] = searx
 sys.modules["searx.plugins"] = searx_plugins
@@ -146,12 +150,14 @@ def mock_search():
 @app.route("/")
 def index():
     query = request.args.get("q", "why is the sky blue")
-    
+    pageno = int(request.args.get("pageno", 1))
+
     class MockSearchQuery:
         pageno = 1
         lang = 'en'
         categories = ['general']
     MockSearchQuery.query = query
+    MockSearchQuery.pageno = pageno
     
     class MockSearch:
         search_query = MockSearchQuery()
@@ -224,9 +230,45 @@ def index():
         <p class="meta">Provider: <strong>{plugin.provider or 'Not configured'}</strong> | Model: <strong>{plugin.model or 'N/A'}</strong></p>
         <p>Query: <strong>{query}</strong></p>
         <hr>
+        <section id="answers">
         {injection_html if injection_html else '<p style="color:#f66;">Plugin inactive. Set LLM_PROVIDER and LLM_KEY in .env</p>'}
+        </section>
+        <div id="main_results" style="margin-top: 1.5rem;">
+            <style>
+                .result {{ margin: 0.8rem 0; }}
+                .result .url_header {{ color: #81a1c1; font-size: 0.85rem; text-decoration: none; }}
+                .result h3 {{ margin: 0.3rem 0; font-size: 1.05rem; }}
+                .result .content {{ margin: 0; color: #d8dee9; font-size: 0.92rem; }}
+                .result .engines {{
+                    display: flex; flex-wrap: wrap; justify-content: flex-end;
+                    margin-top: 0.5rem;  /* mirrors the theme: no align-items -> default stretch */
+                    color: #81a1c1; font-size: smaller;
+                }}
+                .result .engines span {{ margin-right: 0.5rem; }}
+                .result .break {{ clear: both; }}
+            </style>
+            <article class="result result-default category-general">
+                <div class="result_inner">
+                    <a class="url_header" href="https://en.wikipedia.org/wiki/Rayleigh_scattering">en.wikipedia.org/wiki/Rayleigh_scattering</a>
+                    <h3><a href="https://en.wikipedia.org/wiki/Rayleigh_scattering">Rayleigh scattering - Wikipedia</a></h3>
+                    <p class="content">Rayleigh scattering is the predominantly elastic scattering of light by particles much smaller than the wavelength of the radiation. It is why the daytime sky appears blue.</p>
+                </div>
+                <div class="engines"><span>wikipedia</span></div>
+                <div class="break"></div>
+            </article>
+            <article class="result result-default category-general">
+                <div class="result_inner">
+                    <a class="url_header" href="https://science.nasa.gov/blue-sky/">science.nasa.gov/blue-sky</a>
+                    <h3><a href="https://science.nasa.gov/blue-sky/">NASA Science: Why is the sky blue?</a></h3>
+                    <p class="content">Shorter blue wavelengths scatter more than longer red wavelengths — the phenomenon discovered by Lord Rayleigh in the 1870s.</p>
+                </div>
+                <div class="engines"><span>bing</span><span>google</span><span>ddg</span></div>
+                <div class="break"></div>
+            </article>
+        </div>
         <hr>
-        <p class="meta">Try: <a href="/?q=what+is+quantum+computing">/?q=what+is+quantum+computing</a></p>
+        <p class="meta">Try: <a href="/?q=what+is+quantum+computing">/?q=what+is+quantum+computing</a> &middot; <a href="/?q=what+is+quantum+computing&amp;pageno=2">/?q=...&amp;pageno=2</a> (summary-only: no answer box, no empty box)</p>
+        <p class="meta">Each result has an <strong>AI</strong> button that streams an inline summary of that page.</p>
     </body>
     </html>
     """

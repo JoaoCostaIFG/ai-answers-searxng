@@ -9,6 +9,7 @@ Features:
 - safe Markdown formatting for headings, lists, links, quotes, emphasis, and code
 - clickable inline citations
 - interactive mode to continue summary, ask follow ups, copy, or regenerate
+- per-result **AI summary button**: fetches the page server-side and streams an inline TL;DR under any search result
 - simple response mode with no extras
 - internally called low-latency RAG for follow ups (bypasses http loopback)
 - native network integration via `searx.network` (respects proxy/SSL settings)
@@ -50,6 +51,10 @@ Configure via the environment variables:
 - `LLM_INTERACTIVE`: UI mode. Default is `true` (interactive: copy, regenerate, follow up). Set to `false` for simple response only mode.
 - `LLM_QUESTION_MARK_REQUIRED`: Only trigger AI answers when the query contains `?`. Default `false`.
 - `LLM_OLLAMA_UNLOAD_AFTER`: Unload Ollama model after each response. Default `false`.
+**Result Summaries:**
+- `LLM_RESULT_SUMMARY`: Add an `AI` button to every search result that streams an inline summary of that page. Default `true`.
+- `LLM_RESULT_SUMMARY_MAX_CHARS`: How much text extracted from the fetched page is fed to the model. Default `8000`.
+- `LLM_RESULT_SUMMARY_MAX_TOKENS`: Response budget for result summaries. Default `300` (capped to `LLM_MAX_TOKENS`).
 **Advanced LLM Settings:**
 - `LLM_REASONING_MAX_TOKENS`: Budget for thinking models (in addition to `LLM_MAX_TOKENS`). Default `0`.
 - `LLM_EXTRA_BODY`: Custom JSON payload merged into the API request.
@@ -66,6 +71,7 @@ Configure via the environment variables:
 5 inject the ui/logic "shell" into standard results answer object 
 6 client side script calls custom endpoint with signed token
 7 LLM response streams back token by token
+8 optional: each result gets an `AI` button; clicking it calls `/ai-summarize`, which fetches that page server-side (falling back to the result snippet), extracts readable text, and streams a summary into an inline panel
 
 ## Examples
 
@@ -117,11 +123,13 @@ LLM_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
 - **Signed Tokens:** Streaming endpoints require HMAC-SHA256 signed tokens derived from `server.secret_key` with a 1-hour TTL.
 - **Secret Hygiene:** Ensure `server.secret_key` is set in `settings.yml`. Unset or default secrets (`ultrasecretkey`) will trigger a startup warning.
 - **Client Protection:** API keys and provider endpoints are processed strictly server-side and are never exposed to the browser.
+- **Result Summary Fetching:** `/ai-summarize` only fetches public `http(s)` URLs; loopback, private, link-local, and reserved targets are blocked, at most 3 redirects are followed, and at most 1 MiB is read per page.
 
 ## Development
 ```bash
 pip install flask flask-babel
-python tests/demo.py   # UI demo at localhost:5000
+python tests/demo.py       # UI demo at localhost:5000
+python tests/test_summary.py  # offline end-to-end check (fake LLM + fake page servers)
 ```
 
 ## Troubleshooting

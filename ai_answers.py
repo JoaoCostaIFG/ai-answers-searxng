@@ -1,5 +1,6 @@
-import json, os, logging, base64, time, hashlib, codecs, re, http.client, ssl, hmac
-from urllib.parse import urlparse
+import json, os, logging, base64, time, hashlib, codecs, re, http.client, ssl, hmac, ipaddress
+from urllib.parse import urlparse, urljoin
+from html.parser import HTMLParser
 from searx import network
 try:
     from searx.network import get_network
@@ -18,12 +19,22 @@ TOKEN_EXPIRY_SEC = 3600
 STREAM_CHUNK_SIZE = 512
 STREAM_TIMEOUT_SEC = 60
 
-def _get_streaming_connection(url: str):
+# Result summary page fetching
+PAGE_FETCH_TIMEOUT_SEC = 12
+PAGE_FETCH_MAX_BYTES = 1024 * 1024
+PAGE_FETCH_MAX_REDIRECTS = 3
+SUMMARY_FETCH_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0 (SearXNG AI Answers)',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,text/plain;q=0.8,*/*;q=0.5',
+    'Accept-Language': 'en;q=0.9,*;q=0.5',
+}
+
+def _get_streaming_connection(url: str, timeout: int = STREAM_TIMEOUT_SEC):
     parsed = urlparse(url)
     host = parsed.hostname
     port = parsed.port or (443 if parsed.scheme == 'https' else 80)
     path = parsed.path + ('?' + parsed.query if parsed.query else '')
-    
+
     verify_ssl = True
     if get_network is not None:
         try:
@@ -31,14 +42,72 @@ def _get_streaming_connection(url: str):
             verify_ssl = getattr(net, 'verify', True)
         except Exception:
             pass
-    
+
     if parsed.scheme == 'https':
         ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
-        conn = http.client.HTTPSConnection(host, port, timeout=STREAM_TIMEOUT_SEC, context=ctx)
+        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=ctx)
     else:
-        conn = http.client.HTTPConnection(host, port, timeout=STREAM_TIMEOUT_SEC)
-    
+        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+
     return conn, path
+
+def _is_fetchable_url(url: str) -> bool:
+    """Basic SSRF guard: only public http(s) targets may be fetched for summaries."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False
+    if parsed.scheme not in ('http', 'https'):
+        return False
+    host = (parsed.hostname or '').lower().rstrip('.')
+    if not host:
+        return False
+    if host == 'localhost' or host.endswith(('.local', '.internal', '.lan', '.home', '.corp', '.localdomain', '.example', '.invalid', '.test')):
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        return True  # regular hostname
+    return not (ip.is_private or ip.is_loopback or ip.is_link_local
+                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
+
+class _TextExtractor(HTMLParser):
+    """Extracts readable visible text from HTML, dropping scripts/styles/boilerplate."""
+    _SKIP = {'script', 'style', 'noscript', 'template', 'svg', 'canvas', 'head',
+             'nav', 'footer', 'aside', 'form', 'iframe', 'select', 'button'}
+    _BLOCK = {'p', 'div', 'br', 'li', 'ul', 'ol', 'tr', 'table', 'td', 'th',
+              'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'section', 'article', 'main',
+              'header', 'blockquote', 'pre', 'dd', 'dt', 'dl', 'figure',
+              'figcaption', 'address'}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self._skip_depth = 0
+        self._parts = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        elif tag in self._BLOCK:
+            self._parts.append('\n')
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP:
+            if self._skip_depth > 0:
+                self._skip_depth -= 1
+        elif tag in self._BLOCK:
+            self._parts.append('\n')
+
+    def handle_data(self, data):
+        if self._skip_depth == 0 and data and data.strip():
+            self._parts.append(data)
+
+    def get_text(self):
+        text = ''.join(self._parts)
+        text = re.sub(r'[ \t\r\f\v]+', ' ', text)
+        text = re.sub(r' ?\n ?', '\n', text)
+        text = re.sub(r'\n{2,}', '\n', text)
+        return text.strip()
 
 
 
@@ -450,6 +519,7 @@ INTERACTIVE_JS = r'''
                                     });
                                     box.style.display = 'block';
                                     if(wrapper) wrapper.style.display = '';
+                                    revealAnswersContainer();
                                     if(footer && is_interactive) footer.style.display = 'flex';
                                     restored = true;
                                 }
@@ -559,6 +629,293 @@ INTERACTIVE_JS = r'''
                         });
 '''
 
+SUMMARY_CSS = '''
+                        .sxng-summarize-btn {
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 0.3rem;
+                            flex: 0 0 auto;
+                            align-self: center;
+                            vertical-align: middle;
+                            margin-left: 0.5rem;
+                            padding: 0.2rem 0.7rem;
+                            border: 1px solid var(--color-result-border, rgba(127, 127, 127, 0.4));
+                            border-radius: 999px;
+                            background: transparent;
+                            color: var(--color-result-link, #5e81ac);
+                            font: inherit;
+                            font-size: 0.85rem;
+                            font-weight: 600;
+                            line-height: 1.2;
+                            cursor: pointer;
+                            opacity: 0.8;
+                            transition: all 0.2s ease;
+                        }
+                        .sxng-summarize-btn:hover {
+                            background: var(--color-result-link, #5e81ac);
+                            border-color: var(--color-result-link, #5e81ac);
+                            color: var(--color-base-background, #fff);
+                            opacity: 1;
+                            transform: translateY(-1px);
+                        }
+                        .sxng-summarize-btn svg { width: 16px; height: 16px; fill: currentColor; }
+                        .sxng-summarize-btn.sxng-active {
+                            background: var(--color-result-link, #5e81ac);
+                            border-color: var(--color-result-link, #5e81ac);
+                            color: var(--color-base-background, #fff);
+                            opacity: 0.9;
+                        }
+                        .sxng-summarize-btn.sxng-active:hover { opacity: 1; }
+                        .sxng-summarize-btn.sxng-loading { opacity: 1; animation: sxng-summary-pulse 1.2s ease-in-out infinite; }
+                        @keyframes sxng-summary-pulse {
+                            0%, 100% { opacity: 0.4; }
+                            50% { opacity: 1; }
+                        }
+                        /* Center the whole source row (theme defaults to stretch/top alignment) */
+                        .sxng-ai-summary-row { align-items: center; }
+                        .sxng-result-summary {
+                            margin: 0.4rem 0 0.2rem;
+                            padding: 0.6rem 0.8rem;
+                            border-left: 3px solid var(--color-result-link, #5e81ac);
+                            background: var(--color-base-background-hover, rgba(127,127,127,0.08));
+                            border-radius: 4px;
+                            font-size: 0.9rem;
+                        }
+                        .sxng-result-summary .sxng-markdown > :last-child { margin-bottom: 0; }
+                        .sxng-result-summary .sxng-markdown p { margin: 0 0 0.5rem; }
+                        .sxng-result-summary .sxng-markdown li { margin: 0.15rem 0; }
+                        .sxng-result-summary .sxng-reasoning {
+                            margin: 0 0 0.5rem;
+                            padding: 0.35rem 0.5rem;
+                            border-left: 2px solid var(--color-result-link, #5e81ac);
+                            background: transparent;
+                            font-size: 0.8rem;
+                            opacity: 0.7;
+                        }
+                        .sxng-result-summary .sxng-reasoning summary {
+                            cursor: pointer;
+                            font-weight: bold;
+                            color: var(--color-result-link, #5e81ac);
+                        }
+                        .sxng-result-summary .sxng-thought-content {
+                            margin-top: 0.35rem;
+                            white-space: pre-wrap;
+                            font-family: monospace;
+                        }
+'''
+
+RESULT_SUMMARY_JS = r'''
+    // ----- Per-result AI summaries -----
+    const summarizeRaf = window.requestAnimationFrame || (cb => setTimeout(cb, 16));
+    const SUMMARY_PARTIAL_TAG = /<\/?t(?:h(?:i(?:n(?:k)?)?)?)?$/;
+
+    const attachSummarizeButton = (article) => {
+        if (!article || article.dataset.sxngAiSummary) return;
+        article.dataset.sxngAiSummary = '1';
+        // image tiles have no room for an inline button
+        if (article.classList.contains('result-images')) return;
+
+        const link = article.querySelector('a.url_header')
+            || article.querySelector('a.url_wrapper')
+            || article.querySelector('h3 a[href^="http"], a.title[href^="http"]')
+            || article.querySelector('a[href^="http"]');
+        if (!link) return;
+
+        let url;
+        try {
+            const u = new URL(link.href, location.href);
+            if (u.protocol !== 'http:' && u.protocol !== 'https:') return;
+            url = u.href;
+        } catch (e) { return; }
+
+        const titleEl = article.querySelector('h3 a, h3, a.title, .title');
+        const title = titleEl ? titleEl.textContent.trim().slice(0, 300) : '';
+        const snippetEl = article.querySelector('.result-content, .content');
+        const snippet = snippetEl ? snippetEl.textContent.trim().slice(0, 500) : '';
+
+        const btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'sxng-summarize-btn';
+        btn.title = 'AI summary of this result';
+        btn.innerHTML = '<svg viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg><span>AI</span>';
+
+        // Place the button inline with the engine/source row ("bing", "wikipedia", ...)
+        const enginesRow = article.querySelector('.engines')
+            || article.querySelector('.result-footer')
+            || article.querySelector('footer');
+        if (enginesRow) {
+            enginesRow.classList.add('sxng-ai-summary-row');
+            enginesRow.appendChild(btn);
+        } else {
+            article.appendChild(btn);
+        }
+
+        // Summary panel renders under the result content, above the engine row
+        const panel = document.createElement('div');
+        panel.className = 'sxng-result-summary';
+        panel.style.display = 'none';
+        const inner = article.querySelector('.result_inner');
+        (inner || article).appendChild(panel);
+
+        let busy = false;
+        let done = false;
+
+        btn.addEventListener('click', async () => {
+            if (busy) return;
+            if (done) {
+                panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+                return;
+            }
+            busy = true;
+            btn.classList.add('sxng-loading');
+            panel.style.display = 'block';
+            panel.replaceChildren();
+            const cursor = document.createElement('span');
+            cursor.className = 'sxng-cursor';
+            panel.appendChild(cursor);
+            const content = document.createElement('div');
+            content.className = 'sxng-markdown';
+            panel.insertBefore(content, cursor);
+
+            const fail = (msg) => {
+                const err = document.createElement('span');
+                err.style.color = '#bf616a';
+                err.textContent = msg;
+                panel.appendChild(err);
+            };
+
+            try {
+                const controller = new AbortController();
+                let timeoutId = setTimeout(() => controller.abort(), 60000);
+                const res = await fetch(script_root + '/ai-summarize', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({
+                        url: url,
+                        title: title,
+                        snippet: snippet,
+                        q: q_init,
+                        lang: lang_init,
+                        tk: tk_init
+                    }),
+                    signal: controller.signal
+                });
+                if (!res.ok) throw new Error('HTTP ' + res.status);
+
+                const reader = res.body.getReader();
+                const decoder = new TextDecoder();
+                let buf = '', collected = '', thinking = false, thoughtEl = null;
+                let renderQueued = false;
+                const render = () => {
+                    renderQueued = false;
+                    renderMarkdown(content, collected, []);
+                };
+                const queueRender = () => {
+                    if (!renderQueued) { renderQueued = true; summarizeRaf(render); }
+                };
+                const startThought = () => {
+                    const details = document.createElement('details');
+                    details.className = 'sxng-reasoning';
+                    details.innerHTML = '<summary>Thought Process</summary>';
+                    thoughtEl = document.createElement('div');
+                    thoughtEl.className = 'sxng-thought-content';
+                    details.appendChild(thoughtEl);
+                    content.before(details);
+                };
+                const consume = (final) => {
+                    if (final) {
+                        buf = buf.replace(SUMMARY_PARTIAL_TAG, '');
+                    } else if (SUMMARY_PARTIAL_TAG.test(buf)) {
+                        return; // wait for more data, a <think> tag may be split across chunks
+                    }
+                    while (true) {
+                        const openIdx = buf.indexOf('<think>');
+                        const closeIdx = buf.indexOf('</think>');
+                        if (!thinking) {
+                            if (openIdx !== -1 && (closeIdx === -1 || openIdx < closeIdx)) {
+                                const pre = buf.substring(0, openIdx);
+                                if (pre) { collected += pre; queueRender(); }
+                                buf = buf.substring(openIdx + 7);
+                                thinking = true;
+                                startThought();
+                                continue;
+                            }
+                            if (closeIdx !== -1) { buf = buf.replace('</think>', ''); continue; }
+                            break;
+                        } else {
+                            if (closeIdx !== -1 && (openIdx === -1 || closeIdx < openIdx)) {
+                                if (thoughtEl) thoughtEl.textContent += buf.substring(0, closeIdx);
+                                buf = buf.substring(closeIdx + 8);
+                                thinking = false;
+                                continue;
+                            }
+                            if (openIdx !== -1) { buf = buf.replace('<think>', ''); continue; }
+                            break;
+                        }
+                    }
+                    if (buf) {
+                        if (thinking && thoughtEl) thoughtEl.textContent += buf;
+                        else if (!thinking) { collected += buf; queueRender(); }
+                        buf = '';
+                    }
+                };
+
+                while (true) {
+                    const {done: readDone, value} = await reader.read();
+                    if (readDone) { consume(true); break; }
+                    clearTimeout(timeoutId);
+                    timeoutId = setTimeout(() => controller.abort(), 60000);
+                    const chunk = decoder.decode(value, {stream: true});
+                    if (!chunk) continue;
+                    buf += chunk;
+                    consume(false);
+                }
+                render();
+
+                if (!collected.trim()) {
+                    if (thoughtEl && thoughtEl.textContent.trim()) {
+                        const warn = document.createElement('span');
+                        warn.style.color = '#ebcb8b';
+                        warn.textContent = 'Model provided reasoning but stopped before the summary. Try increasing token limits.';
+                        panel.appendChild(warn);
+                    } else {
+                        fail('No summary received. Check API configuration and server logs.');
+                    }
+                }
+                done = true;
+                btn.classList.add('sxng-active');
+            } catch (e) {
+                if (e && e.name === 'AbortError') fail('⚠️ Timed out while summarizing.');
+                else fail('⚠️ ' + (e && e.message ? e.message : 'Summary failed.'));
+                done = true;
+            } finally {
+                busy = false;
+                btn.classList.remove('sxng-loading');
+                const cur = panel.querySelector('.sxng-cursor');
+                if (cur) cur.remove();
+            }
+        });
+    };
+
+    const attachAllSummarizeButtons = () => {
+        document.querySelectorAll('article.result').forEach(attachSummarizeButton);
+    };
+    attachAllSummarizeButtons();
+
+    const resultsContainer = document.getElementById('main_results');
+    if (resultsContainer && window.MutationObserver) {
+        let attachScheduled = false;
+        new MutationObserver(() => {
+            if (attachScheduled) return;
+            attachScheduled = true;
+            summarizeRaf(() => {
+                attachScheduled = false;
+                attachAllSummarizeButtons();
+            });
+        }).observe(resultsContainer, {childList: true, subtree: true});
+    }
+'''
+
 FRONTEND_JS_TEMPLATE = r"""
 (async () => {
     const is_interactive = __IS_INTERACTIVE__;
@@ -588,6 +945,28 @@ FRONTEND_JS_TEMPLATE = r"""
     if (answersContainer) answersContainer.classList.add('sxng-ai-answers-container');
     const wrapper = box.closest('.answer');
     if (wrapper) wrapper.style.display = 'none';
+    // While our box is hidden (summary-only pages, or before the stream starts),
+    // the themed #answers container would show as an empty styled box above the
+    // results. Collapse it until our answer (or a native answer) becomes visible.
+    const collapseEmptyAnswers = () => {
+        if (!answersContainer || answersContainer.dataset.sxngAiCollapsed) return;
+        const hasVisibleContent = Array.from(answersContainer.children).some(el => {
+            if (el === box || el.contains(box)) return false; // our (hidden) shell
+            if (el.tagName === 'H4') return false;            // "Answers" title, hidden by theme CSS
+            return el.style.display !== 'none';               // anything else visible
+        });
+        if (!hasVisibleContent) {
+            answersContainer.dataset.sxngAiCollapsed = '1';
+            answersContainer.style.display = 'none';
+        }
+    };
+    const revealAnswersContainer = () => {
+        if (answersContainer && answersContainer.dataset.sxngAiCollapsed) {
+            answersContainer.style.display = '';
+            delete answersContainer.dataset.sxngAiCollapsed;
+        }
+    };
+    collapseEmptyAnswers();
     let restored = false;
     let isStreaming = false;
 
@@ -606,6 +985,7 @@ FRONTEND_JS_TEMPLATE = r"""
     __CITATION_HELPER_JS__
 
     __HIDE_NATIVE_JS__
+    collapseEmptyAnswers();
 
     __INTERACTIVE_JS_INIT__
 
@@ -626,6 +1006,7 @@ FRONTEND_JS_TEMPLATE = r"""
             const ctx = auxContext || conversation.originalContext;
             if (wrapper) wrapper.style.display = '';
             box.style.display = 'block';
+            revealAnswersContainer();
 
             const controller = new AbortController();
             let timeoutId = setTimeout(() => controller.abort(), 60000);
@@ -851,7 +1232,9 @@ FRONTEND_JS_TEMPLATE = r"""
         }
     }
 
-    if (!restored) startStream();
+    __RESULT_SUMMARY_JS__
+
+    if (!restored && __RUN_MAIN_STREAM__) startStream();
 })();
 """
 
@@ -991,6 +1374,19 @@ class SXNGPlugin(Plugin):
             logger.warning(f"{PLUGIN_NAME}: Invalid LLM_CONTEXT_SHALLOW_COUNT value. Enforcing default (15).")
             self.context_shallow_count = 15
 
+        self.result_summary = os.getenv('LLM_RESULT_SUMMARY', 'true').lower().strip() in ('true', '1', 'yes', 'on')
+        try:
+            self.result_summary_max_chars = max(500, int(os.getenv('LLM_RESULT_SUMMARY_MAX_CHARS', 8000)))
+        except ValueError:
+            logger.warning(f"{PLUGIN_NAME}: Invalid LLM_RESULT_SUMMARY_MAX_CHARS value. Enforcing default (8000).")
+            self.result_summary_max_chars = 8000
+        try:
+            self.result_summary_max_tokens = max(50, int(os.getenv('LLM_RESULT_SUMMARY_MAX_TOKENS', 300)))
+        except ValueError:
+            logger.warning(f"{PLUGIN_NAME}: Invalid LLM_RESULT_SUMMARY_MAX_TOKENS value. Enforcing default (300).")
+            self.result_summary_max_tokens = 300
+        self.result_summary_max_tokens = min(self.result_summary_max_tokens, self.max_tokens)
+
         self.allowed_tabs = set(t.strip() for t in os.getenv('LLM_TABS', DEFAULT_TABS).split(','))
         self.collapsed = os.getenv('LLM_COLLAPSED', 'true').lower().strip() in ('true', '1', 'yes', 'on')
         self.hide_native_answers = os.getenv('LLM_HIDE_NATIVE_ANSWERS', 'true').lower().strip() in ('true', '1', 'yes', 'on')
@@ -1075,6 +1471,289 @@ class SXNGPlugin(Plugin):
                    
         return results, infoboxes, answers
 
+    def _token_ok(self, token: str) -> bool:
+        try:
+            ts, sig = token.rsplit('.', 1)
+            expected = hmac.new(self.secret.encode('utf-8'), ts.encode('utf-8'), hashlib.sha256).hexdigest()
+            return hmac.compare_digest(sig, expected) and (time.time() - float(ts)) <= TOKEN_EXPIRY_SEC
+        except (ValueError, KeyError, AttributeError):
+            return False
+
+    def _llm_response(self, system_message: str, user_message: str, max_tokens: int = None) -> Response:
+        """Streams an LLM answer for the given prompt as a Flask response."""
+        if max_tokens is None:
+            max_tokens = self.max_tokens
+        gen_fn = self._stream_gemini if self.is_gemini else self._stream_openai_compatible
+
+        def generator():
+            try:
+                yield from gen_fn(system_message, user_message, max_tokens)
+            finally:
+                if getattr(self, 'ollama_unload_after', False):
+                    self._ollama_unload_model()
+
+        return Response(generator(), mimetype='text/event-stream', headers={
+            'X-Accel-Buffering': 'no',
+            'Cache-Control': 'no-cache, no-store',
+            'Connection': 'keep-alive'
+        })
+
+    def _fetch_page_text(self, url: str) -> tuple:
+        """Fetches a public page and returns (readable_text_or_None, final_url)."""
+        current = url
+        for _ in range(PAGE_FETCH_MAX_REDIRECTS + 1):
+            if not _is_fetchable_url(current):
+                return None, current
+            conn, path = _get_streaming_connection(current, timeout=PAGE_FETCH_TIMEOUT_SEC)
+            try:
+                conn.request('GET', path, headers=dict(SUMMARY_FETCH_HEADERS))
+                res = conn.getresponse()
+
+                if res.status in (301, 302, 303, 307, 308):
+                    location = res.getheader('Location') or ''
+                    res.read(1024)
+                    if not location:
+                        return None, current
+                    current = urljoin(current, location)
+                    continue
+
+                if res.status != 200:
+                    return None, current
+
+                ctype = (res.getheader('Content-Type') or '').lower()
+                if ctype and not re.match(
+                    r'^(?:text/html|application/xhtml|text/plain|application/xml|text/xml|application/json)', ctype
+                ):
+                    return None, current
+
+                raw = res.read(PAGE_FETCH_MAX_BYTES)
+                if not raw:
+                    return None, current
+
+                m = re.search(r'charset=["\']?([A-Za-z0-9_.:-]+)', ctype)
+                charset = m.group(1) if m else ''
+                if not charset:
+                    meta = re.search(rb'charset=["\']?([A-Za-z0-9_.:-]+)', raw[:2048], re.I)
+                    charset = meta.group(1).decode('ascii', 'ignore') if meta else ''
+                try:
+                    html_text = raw.decode(charset) if charset else raw.decode('utf-8', errors='replace')
+                except (LookupError, UnicodeDecodeError):
+                    html_text = raw.decode('utf-8', errors='replace')
+
+                extractor = _TextExtractor()
+                try:
+                    extractor.feed(html_text)
+                    text = extractor.get_text()
+                except Exception:
+                    text = re.sub(r'<[^>]+>', ' ', html_text)
+                if not text:
+                    return None, current
+                return text[:self.result_summary_max_chars], current
+            except Exception as e:
+                logger.debug(f"{PLUGIN_NAME}: summary page fetch failed for {current}: {e}")
+                return None, current
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        return None, current
+
+
+
+    def _stream_gemini(self, system_message: str, user_message: str, max_tokens: int):
+        if '?' in self.endpoint_url:
+            url = f"{self.endpoint_url}&key={self.api_key}"
+        else:
+            url = f"{self.endpoint_url}?key={self.api_key}"
+
+        conn = None
+        try:
+            conn, path = _get_streaming_connection(url)
+            payload = json.dumps({
+                "systemInstruction": {"parts": [{"text": system_message}]},
+                "contents": [{"parts": [{"text": user_message}]}],
+                "generationConfig": {"maxOutputTokens": min((max_tokens + self.reasoning_max_tokens) * 4, 8192), "temperature": self.temperature}
+            })
+            conn.request("POST", path, body=payload.encode('utf-8'), headers={"Content-Type": "application/json"})
+            res = conn.getresponse()
+
+            if res.status != 200:
+                body = res.read(2048).decode('utf-8', errors='replace')[:500]
+                logger.error(f"{PLUGIN_NAME}: Gemini API {res.status}: {body}")
+                yield f"\n⚠️ API error {res.status}. Check server logs.\n"
+                return
+
+            decoder = json.JSONDecoder()
+            utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
+            buffer = ""
+            while True:
+                chunk = res.read(STREAM_CHUNK_SIZE)
+                if not chunk: 
+                    buffer += utf8_decoder.decode(b'', final=True)
+                    break
+                buffer += utf8_decoder.decode(chunk)
+                while buffer:
+                    buffer = buffer.lstrip()
+                    if buffer.startswith('['):
+                        buffer = buffer[1:].lstrip()
+                    elif buffer.startswith(','):
+                        buffer = buffer[1:].lstrip()
+                    elif buffer.startswith(']'):
+                        buffer = buffer[1:].lstrip()
+
+                    if not buffer: break
+                    try:
+                        obj, idx = decoder.raw_decode(buffer)
+                        items = obj if isinstance(obj, list) else [obj]
+                        for item in items:
+                            if not isinstance(item, dict):
+                                continue
+
+                            if 'promptFeedback' in item and item['promptFeedback'].get('blockReason'):
+                                yield f"\n⚠️ Gemini blocked prompt. Reason: {item['promptFeedback']['blockReason']}\n"
+                                return
+
+                            candidates = item.get('candidates')
+                            if not isinstance(candidates, list) or len(candidates) == 0:
+                                continue
+
+                            first_candidate = candidates[0]
+                            if not isinstance(first_candidate, dict):
+                                continue
+
+                            if first_candidate.get('finishReason') == 'SAFETY':
+                                yield "\n⚠️ Gemini stopped generation due to safety filters.\n"
+                                return
+
+                            content = first_candidate.get('content')
+                            if not isinstance(content, dict):
+                                continue
+
+                            parts = content.get('parts')
+                            if not isinstance(parts, list) or len(parts) == 0:
+                                continue
+
+                            first_part = parts[0]
+                            if isinstance(first_part, dict):
+                                text = first_part.get('text')
+                                if text and isinstance(text, str):
+                                    yield text
+
+                        buffer = buffer[idx:]
+                    except json.JSONDecodeError: 
+                        break
+                    except Exception as parse_err:
+                        logger.debug(f"{PLUGIN_NAME}: Ignored malformed Gemini chunk. Error: {parse_err}")
+                        break
+        except Exception as e:
+            logger.error(f"{PLUGIN_NAME}: Gemini stream error: {e}")
+            yield f"\n⚠️ Connection Error: {e}\n"
+        finally:
+            if conn: conn.close()
+
+    def _stream_openai_compatible(self, system_message: str, user_message: str, max_tokens: int):
+        conn = None
+        try:
+            conn, path = _get_streaming_connection(self.endpoint_url)
+            body = {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_message},
+                    {"role": "user", "content": user_message}
+                ],
+                "stream": True,
+                "max_tokens": max_tokens + self.reasoning_max_tokens,
+                "temperature": self.temperature
+            }
+            body.update(self.extra_body)
+            payload = json.dumps(body)
+            headers = {
+                "Content-Type": "application/json",
+                "Accept": "text/event-stream",
+                "HTTP-Referer": "https://github.com/searxng/searxng",
+                "X-Title": "SearXNG"
+            }
+            if self.provider == 'azure':
+                headers['api-key'] = self.api_key
+            else:
+                headers['Authorization'] = f"Bearer {self.api_key}"
+            conn.request("POST", path, body=payload.encode('utf-8'), headers=headers)
+            res = conn.getresponse()
+
+            if res.status != 200:
+                body = res.read(2048).decode('utf-8', errors='replace')[:500]
+                logger.error(f"{PLUGIN_NAME}: {self.provider} API {res.status}: {body}")
+                yield f"\n⚠️ API error {res.status}. Check server logs.\n"
+                return
+
+            decoder = json.JSONDecoder()
+            in_reasoning_block = False
+
+            while True:
+                line_bytes = res.readline()
+                if not line_bytes: break
+
+                line = line_bytes.decode('utf-8', errors='replace').strip()
+                if not line: 
+                    continue
+
+                if line.startswith("data: "):
+                    data_str = line[6:].strip()
+                    if data_str == "[DONE]":
+                        if in_reasoning_block:
+                            yield "\n</think>\n\n"
+                        return
+                    try:
+                        obj, _ = decoder.raw_decode(data_str)
+                        if not isinstance(obj, dict):
+                            continue
+
+                        # Catch upstream errors
+                        if "error" in obj:
+                            err_msg = obj["error"].get("message", str(obj["error"])) if isinstance(obj["error"], dict) else str(obj["error"])
+                            yield f"\n⚠️ API Error: {err_msg}\n"
+                            return
+
+                        choices = obj.get("choices")
+                        if not isinstance(choices, list) or len(choices) == 0:
+                            continue
+
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            continue
+
+                        delta = choice.get("delta")
+                        if not isinstance(delta, dict):
+                            continue
+
+                        reasoning = delta.get("reasoning_content")
+                        content = delta.get("content")
+
+                        if reasoning and isinstance(reasoning, str):
+                            if not in_reasoning_block:
+                                yield "<think>\n"
+                                in_reasoning_block = True
+                            yield reasoning
+
+                        if content and isinstance(content, str):
+                            if in_reasoning_block:
+                                yield "\n</think>\n\n"
+                                in_reasoning_block = False
+                            yield content
+                    except json.JSONDecodeError:
+                        pass
+                    except Exception as parse_err:
+                        logger.debug(f"{PLUGIN_NAME}: Ignored malformed OpenAI chunk. Error: {parse_err}")
+                        pass
+
+            if in_reasoning_block:
+                yield "\n</think>\n\n"
+        except Exception as e:
+            logger.error(f"{PLUGIN_NAME}: {self.provider} stream error: {e}")
+            yield f"\n⚠️ Connection Error: {e}\n"
+        finally:
+            if conn: conn.close()
 
 
     def init(self, app):
@@ -1088,14 +1767,9 @@ class SXNGPlugin(Plugin):
             
             data = request.json or {}
             token = data.get('tk', '')
-            
+
             # Token access control
-            try:
-                ts, sig = token.rsplit('.', 1)
-                expected = hmac.new(self.secret.encode('utf-8'), ts.encode('utf-8'), hashlib.sha256).hexdigest()
-                if not hmac.compare_digest(sig, expected) or (time.time() - float(ts)) > TOKEN_EXPIRY_SEC:
-                    abort(403)
-            except (ValueError, KeyError, AttributeError):
+            if not self._token_ok(token):
                 abort(403)
             query = data.get('query', '').strip()
             lang = data.get('lang', 'all')
@@ -1149,20 +1823,71 @@ class SXNGPlugin(Plugin):
                 logger.error(f"{PLUGIN_NAME}: Aux search failed: {e}")
                 return jsonify({'results': [], 'error': 'Search failed'}), 500
 
+        @app.route('/ai-summarize', methods=['POST'])
+        def ai_summarize_result():
+            if not getattr(self, 'result_summary', False) or not self.api_key:
+                abort(403)
+
+            data = request.json or {}
+            if not self._token_ok(data.get('tk', '')):
+                abort(403)
+
+            url = str(data.get('url', '')).strip()
+            title = str(data.get('title', '')).strip()[:300]
+            snippet = str(data.get('snippet', '')).strip()[:800]
+            q = str(data.get('q', '')).strip()[:400]
+            lang = str(data.get('lang', 'all'))[:12]
+            if not url or not _is_fetchable_url(url):
+                abort(400)
+
+            page_text = None
+            try:
+                page_text, _final_url = self._fetch_page_text(url)
+            except Exception as e:
+                logger.warning(f"{PLUGIN_NAME}: summarize fetch error for {url}: {e}")
+
+            if page_text:
+                content_block = page_text
+            else:
+                meta = ' '.join(part for part in (title, snippet) if part).strip()
+                content_block = ("[Full page content could not be fetched. "
+                                 "Only the search result metadata below is available.]\n" + meta) \
+                                or "[No content available.]"
+
+            today = time.strftime("%Y-%m-%d")
+            lang_instruction = f" Respond in {lang}." if lang not in ('all', 'auto') else ""
+            system_message = (
+                "You are a precise web page summarizer embedded in a meta-search engine. "
+                f"Today is {today}.{lang_instruction}"
+            )
+            query_note = f'\nThe user\'s search query was: "{q}". Emphasize the parts of the page relevant to it.' if q else ''
+            target_words = max(60, int(self.result_summary_max_tokens * 0.6))
+            user_message = f"""<PAGE>
+Title: {title or '(untitled)'}
+URL: {url}
+{query_note}
+Content:
+{content_block}
+</PAGE>
+
+TASK: Summarize this page for the user.
+1. Start with a direct 1-2 sentence TL;DR of what this page says.
+2. Follow with 3-5 bullet points covering the key facts, figures, or steps.
+3. Use only simple Markdown: bold and bullet lists. No headings, links, citations, tables, or code blocks.
+4. Target length: ~{target_words} words. No preamble, no meta-commentary.
+5. If the content notes it could not be fetched, work with the metadata and mention that limitation in one short sentence."""
+
+            return self._llm_response(system_message, user_message, self.result_summary_max_tokens)
+
         @app.route('/ai-stream', methods=['POST'])
         def handle_ai_stream():
             data = request.json or {}
-            
+
             token = data.get('tk', '')
             q = data.get('q', '')
             lang = data.get('lang', 'all')
-            
-            try:
-                ts, sig = token.rsplit('.', 1)
-                expected = hmac.new(self.secret.encode('utf-8'), ts.encode('utf-8'), hashlib.sha256).hexdigest()
-                if not hmac.compare_digest(sig, expected) or (time.time() - float(ts)) > TOKEN_EXPIRY_SEC:
-                    abort(403)
-            except (ValueError, KeyError, AttributeError):
+
+            if not self._token_ok(token):
                 abort(403)
 
             context_text = data.get('context', '')
@@ -1223,220 +1948,7 @@ class SXNGPlugin(Plugin):
 
 <USER_QUERY>{q}</USER_QUERY>"""
 
-            def stream_gemini():
-                if '?' in self.endpoint_url:
-                    url = f"{self.endpoint_url}&key={self.api_key}"
-                else:
-                    url = f"{self.endpoint_url}?key={self.api_key}"
-
-                conn = None
-                try:
-                    conn, path = _get_streaming_connection(url)
-                    payload = json.dumps({
-                        "systemInstruction": {"parts": [{"text": system_message}]},
-                        "contents": [{"parts": [{"text": user_message}]}],
-                        "generationConfig": {"maxOutputTokens": min((self.max_tokens + self.reasoning_max_tokens) * 4, 8192), "temperature": self.temperature}
-                    })
-                    conn.request("POST", path, body=payload.encode('utf-8'), headers={"Content-Type": "application/json"})
-                    res = conn.getresponse()
-                     
-                    if res.status != 200:
-                        body = res.read(2048).decode('utf-8', errors='replace')[:500]
-                        logger.error(f"{PLUGIN_NAME}: Gemini API {res.status}: {body}")
-                        yield f"\n⚠️ API error {res.status}. Check server logs.\n"
-                        return
-
-                    decoder = json.JSONDecoder()
-                    utf8_decoder = codecs.getincrementaldecoder('utf-8')(errors='replace')
-                    buffer = ""
-                    while True:
-                        chunk = res.read(STREAM_CHUNK_SIZE)
-                        if not chunk: 
-                            buffer += utf8_decoder.decode(b'', final=True)
-                            break
-                        buffer += utf8_decoder.decode(chunk)
-                        while buffer:
-                            buffer = buffer.lstrip()
-                            if buffer.startswith('['):
-                                buffer = buffer[1:].lstrip()
-                            elif buffer.startswith(','):
-                                buffer = buffer[1:].lstrip()
-                            elif buffer.startswith(']'):
-                                buffer = buffer[1:].lstrip()
-                                
-                            if not buffer: break
-                            try:
-                                obj, idx = decoder.raw_decode(buffer)
-                                items = obj if isinstance(obj, list) else [obj]
-                                for item in items:
-                                    if not isinstance(item, dict):
-                                        continue
-                                    
-                                    if 'promptFeedback' in item and item['promptFeedback'].get('blockReason'):
-                                        yield f"\n⚠️ Gemini blocked prompt. Reason: {item['promptFeedback']['blockReason']}\n"
-                                        return
-                                        
-                                    candidates = item.get('candidates')
-                                    if not isinstance(candidates, list) or len(candidates) == 0:
-                                        continue
-                                        
-                                    first_candidate = candidates[0]
-                                    if not isinstance(first_candidate, dict):
-                                        continue
-                                    
-                                    if first_candidate.get('finishReason') == 'SAFETY':
-                                        yield "\n⚠️ Gemini stopped generation due to safety filters.\n"
-                                        return
-                                        
-                                    content = first_candidate.get('content')
-                                    if not isinstance(content, dict):
-                                        continue
-                                        
-                                    parts = content.get('parts')
-                                    if not isinstance(parts, list) or len(parts) == 0:
-                                        continue
-                                        
-                                    first_part = parts[0]
-                                    if isinstance(first_part, dict):
-                                        text = first_part.get('text')
-                                        if text and isinstance(text, str):
-                                            yield text
-                                            
-                                buffer = buffer[idx:]
-                            except json.JSONDecodeError: 
-                                break
-                            except Exception as parse_err:
-                                logger.debug(f"{PLUGIN_NAME}: Ignored malformed Gemini chunk. Error: {parse_err}")
-                                break
-                except Exception as e:
-                    logger.error(f"{PLUGIN_NAME}: Gemini stream error: {e}")
-                    yield f"\n⚠️ Connection Error: {e}\n"
-                finally:
-                    if conn: conn.close()
-
-            def stream_openai_compatible():
-                conn = None
-                try:
-                    conn, path = _get_streaming_connection(self.endpoint_url)
-                    body = {
-                        "model": self.model,
-                        "messages": [
-                            {"role": "system", "content": system_message},
-                            {"role": "user", "content": user_message}
-                        ],
-                        "stream": True,
-                        "max_tokens": self.max_tokens + self.reasoning_max_tokens,
-                        "temperature": self.temperature
-                    }
-                    body.update(self.extra_body)
-                    payload = json.dumps(body)
-                    headers = {
-                        "Content-Type": "application/json",
-                        "Accept": "text/event-stream",
-                        "HTTP-Referer": "https://github.com/searxng/searxng",
-                        "X-Title": "SearXNG"
-                    }
-                    if self.provider == 'azure':
-                        headers['api-key'] = self.api_key
-                    else:
-                        headers['Authorization'] = f"Bearer {self.api_key}"
-                    conn.request("POST", path, body=payload.encode('utf-8'), headers=headers)
-                    res = conn.getresponse()
-
-                    if res.status != 200:
-                        body = res.read(2048).decode('utf-8', errors='replace')[:500]
-                        logger.error(f"{PLUGIN_NAME}: {self.provider} API {res.status}: {body}")
-                        yield f"\n⚠️ API error {res.status}. Check server logs.\n"
-                        return
-
-                    decoder = json.JSONDecoder()
-                    in_reasoning_block = False
-                    
-                    while True:
-                        line_bytes = res.readline()
-                        if not line_bytes: break
-                        
-                        line = line_bytes.decode('utf-8', errors='replace').strip()
-                        if not line: 
-                            continue
-                            
-                        if line.startswith("data: "):
-                            data_str = line[6:].strip()
-                            if data_str == "[DONE]":
-                                if in_reasoning_block:
-                                    yield "\n</think>\n\n"
-                                return
-                            try:
-                                obj, _ = decoder.raw_decode(data_str)
-                                if not isinstance(obj, dict):
-                                    continue
-                                
-                                # Catch upstream errors
-                                if "error" in obj:
-                                    err_msg = obj["error"].get("message", str(obj["error"])) if isinstance(obj["error"], dict) else str(obj["error"])
-                                    yield f"\n⚠️ API Error: {err_msg}\n"
-                                    return
-                                    
-                                choices = obj.get("choices")
-                                if not isinstance(choices, list) or len(choices) == 0:
-                                    continue
-                                    
-                                choice = choices[0]
-                                if not isinstance(choice, dict):
-                                    continue
-                                    
-                                delta = choice.get("delta")
-                                if not isinstance(delta, dict):
-                                    continue
-                                
-                                reasoning = delta.get("reasoning_content")
-                                content = delta.get("content")
-                                
-                                if reasoning and isinstance(reasoning, str):
-                                    if not in_reasoning_block:
-                                        yield "<think>\n"
-                                        in_reasoning_block = True
-                                    yield reasoning
-                                    
-                                if content and isinstance(content, str):
-                                    if in_reasoning_block:
-                                        yield "\n</think>\n\n"
-                                        in_reasoning_block = False
-                                    yield content
-                            except json.JSONDecodeError:
-                                pass
-                            except Exception as parse_err:
-                                logger.debug(f"{PLUGIN_NAME}: Ignored malformed OpenAI chunk. Error: {parse_err}")
-                                pass
-                    
-                    if in_reasoning_block:
-                        yield "\n</think>\n\n"
-                except Exception as e:
-                    logger.error(f"{PLUGIN_NAME}: {self.provider} stream error: {e}")
-                    yield f"\n⚠️ Connection Error: {e}\n"
-                finally:
-                    if conn: conn.close()
-
-            generator = stream_gemini if self.is_gemini else stream_openai_compatible
-
-            if self.provider == 'ollama' and getattr(self, 'ollama_unload_after', False):
-
-                gen_fn = generator
-
-                def generator():
-
-                    try:
-
-                        yield from gen_fn()
-
-                    finally:
-
-                        self._ollama_unload_model()
-            return Response(generator(), mimetype='text/event-stream', headers={
-                'X-Accel-Buffering': 'no',
-                'Cache-Control': 'no-cache, no-store',
-                'Connection': 'keep-alive'
-            })
+            return self._llm_response(system_message, user_message)
         return True
 
     def _assemble_context(self, clean_results, infoboxes, answers, offset=0) -> tuple[str, list]:
@@ -1508,21 +2020,35 @@ class SXNGPlugin(Plugin):
             if request and request.form.get('format', 'html') != 'html':
                 return results
 
-            if self.question_mark_required and '?' not in search.search_query.query:
-                return results
+            # The question-mark filter and page>1 only suppress the main answer box,
+            # per-result summaries may still be injected.
+            main_answer_required = not (self.question_mark_required and '?' not in search.search_query.query)
 
             current_tabs = set(search.search_query.categories)
             if not current_tabs: current_tabs = {'general'}
 
-            if not self.active or not self.api_key or search.search_query.pageno > 1 or not self.allowed_tabs.intersection(current_tabs):
+            if not self.active or not self.api_key or not self.allowed_tabs.intersection(current_tabs):
                 return results
 
-            raw_results = search.result_container.get_ordered_results()
-            raw_infoboxes = getattr(search.result_container, 'infoboxes', [])
-            raw_answers = getattr(search.result_container, 'answers', [])
-            
-            clean_results, infoboxes, answers = self._parse_aux_results(raw_results, raw_infoboxes, raw_answers)
-            context_str, _ = self._assemble_context(clean_results, infoboxes, answers)
+            summary_enabled = getattr(self, 'result_summary', False)
+            main_answer_active = main_answer_required and search.search_query.pageno <= 1
+            if not main_answer_active:
+                # Summary-only shell: pointless without results to attach to, and
+                # injecting would suppress the theme's "no results" message.
+                if not summary_enabled or not search.result_container.get_ordered_results():
+                    return results
+
+            if main_answer_active:
+                raw_results = search.result_container.get_ordered_results()
+                raw_infoboxes = getattr(search.result_container, 'infoboxes', [])
+                raw_answers = getattr(search.result_container, 'answers', [])
+
+                clean_results, infoboxes, answers = self._parse_aux_results(raw_results, raw_infoboxes, raw_answers)
+                context_str, _ = self._assemble_context(clean_results, infoboxes, answers)
+            else:
+                # Summary-only shell: no RAG context needed, the answer box stays hidden
+                clean_results = []
+                context_str = ''
 
             ts = str(int(time.time()))
             q_clean = search.search_query.query.strip()
@@ -1547,7 +2073,7 @@ class SXNGPlugin(Plugin):
 
             is_interactive = self.interactive
             collapsed_class = "sxng-collapsed" if getattr(self, "collapsed", True) else ""
-            hide_native = getattr(self, "hide_native_answers", True)
+            hide_native = getattr(self, "hide_native_answers", True) and main_answer_active
             
             hide_native_js = '''
     const hiddenAnswers = [];
@@ -1573,12 +2099,14 @@ class SXNGPlugin(Plugin):
             interactive_css = INTERACTIVE_CSS if is_interactive else ''
             interactive_html = INTERACTIVE_HTML if is_interactive else ''
             interactive_js_init = INTERACTIVE_JS if is_interactive else ''
+            summary_css = SUMMARY_CSS if summary_enabled else ''
+            result_summary_js = RESULT_SUMMARY_JS if summary_enabled else ''
 
             interactive_js_complete = "footer.style.display = 'flex';" if is_interactive else ''
             stream_fn_sig = 'async function startStream(overrideQ = null, prevAnswer = null, auxContext = null)'
             stream_q = 'overrideQ || q_init' if is_interactive else 'q_init'
             stream_body = f'''prev_answer: prevAnswer''' if is_interactive else ''
-            
+
             js_code = FRONTEND_JS_TEMPLATE \
                 .replace("__IS_INTERACTIVE__", 'true' if is_interactive else 'false') \
                 .replace("__URL_STATE__", 'true' if self.url_state else 'false') \
@@ -1587,6 +2115,8 @@ class SXNGPlugin(Plugin):
                 .replace("__CITATION_HELPER_JS__", CITATION_HELPER_JS) \
                 .replace("__HIDE_NATIVE_JS__", hide_native_js) \
                 .replace("__INTERACTIVE_JS_INIT__", interactive_js_init) \
+                .replace("__RESULT_SUMMARY_JS__", result_summary_js) \
+                .replace("__RUN_MAIN_STREAM__", 'true' if main_answer_active else 'false') \
                 .replace("__STREAM_FN_SIG__", stream_fn_sig) \
                 .replace("__STREAM_Q__", stream_q) \
                 .replace("__STREAM_BODY__", ', ' + stream_body if stream_body else '') \
@@ -1679,6 +2209,7 @@ class SXNGPlugin(Plugin):
                             border-radius: 12px; padding: 4px 12px; cursor: pointer; color: var(--color-result-link, #5e81ac); font-size: 0.85rem; z-index: 10;
                         }}
                         {interactive_css}
+                        {summary_css}
                     </style>
                     <div id="sxng-answer-wrap" class="{collapsed_class}">
                         <div id="sxng-stream-data"><span class="sxng-cursor"></span></div>
